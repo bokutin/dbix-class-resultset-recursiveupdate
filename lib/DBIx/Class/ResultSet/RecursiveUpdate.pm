@@ -69,6 +69,16 @@ sub recursive_update {
 
     local $IN_RU = $IN_RU+1;
 
+    local $SIG{__WARN__} = sub {
+        my $level = 0;
+        my $i = 0;
+        while (1) {
+            my $sub = (caller($i++))[3] or last;
+            $level++ if $sub =~ /(?:recursive_update|_update_relation)$/;
+        }
+        warn "    "x$level, @_;
+    } if DEBUG;
+
     my $source = $self->result_source;
 
     croak "first parameter needs to be defined"
