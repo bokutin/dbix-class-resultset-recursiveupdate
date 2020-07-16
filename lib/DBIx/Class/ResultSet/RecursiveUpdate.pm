@@ -91,13 +91,44 @@ sub recursive_update {
         $pk_kvs{$colname} = $resolved->{$colname}
             if exists $resolved->{$colname} && defined $resolved->{$colname};
     }
+    my @non_pk_columns = grep {
+        my $colname = $_;
+        none { $colname eq $_ } keys %pk_kvs
+    }
+        sort keys %$updates;
+    if ( scalar keys %pk_kvs != scalar @pks && @non_pk_columns) {
+        for my $key (keys %$updates) {
+            next unless $source->has_relationship($key) and _master_relation_cond($self, $key);
+            my $val = do {
+                if ( ref $updates->{$key} ) {
+                    $updates->{$key};
+                }
+                else {
+                    my ($pk) = $source->related_source($key)->primary_columns;
+                    +{ $pk => $updates->{$key} };
+                }
+            };
+            my $relinfo = $source->relationship_info($key);
+            my ($rel_cond, $crosstable) = $source->_resolve_condition(
+                $relinfo->{cond}, $val, $key, $key
+            );
+
+            $self->throw_exception("Complex condition via relationship '$key' is unsupported in find()")
+                if $crosstable or ref($rel_cond) ne 'HASH';
+
+            for my $colname (keys %$rel_cond) {
+                next unless defined $rel_cond->{$colname} and any { $_ eq $colname } @pks;
+                $pk_kvs{$colname} = $rel_cond->{$colname};
+            }
+        }
+    }
     # support the special case where a method on the related row
     # populates one or more primary key columns and we don't have
     # all primary key values already
     # see DBSchema::Result::DVD relationship keysbymethod
     DEBUG and warn "pk columns so far: " . join (', ',
         sort keys %pk_kvs) . "\n";
-    my @non_pk_columns = grep {
+    @non_pk_columns = grep {
         my $colname = $_;
         none { $colname eq $_ } keys %pk_kvs
     }
