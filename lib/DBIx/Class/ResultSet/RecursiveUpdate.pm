@@ -551,6 +551,38 @@ sub _update_relation {
                     if exists $resolved->{$colname}
                         && defined $resolved->{$colname};
             }
+            my @non_pk_columns = grep {
+                    my $colname = $_;
+                    none { $colname eq $_ } keys %pk_kvs
+                }
+                sort keys %$sub_updates;
+            if ( scalar keys %pk_kvs != scalar @pks && @non_pk_columns) {
+                for my $key (keys %$sub_updates) {
+                    next unless $related_source->has_relationship($key) and _master_relation_cond($related_resultset, $key);
+                    my $val = do {
+                        if ( ref $sub_updates->{$key} ) {
+                            $sub_updates->{$key};
+                        }
+                        else {
+                            my ($pk) = $related_source->related_source($key)->primary_columns;
+                            +{ $pk => $sub_updates->{$key} };
+                        }
+                    };
+                    my $relinfo = $related_source->relationship_info($key);
+                    my ($rel_cond, $crosstable) = $related_source->_resolve_condition(
+                        $relinfo->{cond}, $val, $key, $key
+                    );
+
+                    $self->throw_exception("Complex condition via relationship '$key' is unsupported in find()")
+                        if $crosstable or ref($rel_cond) ne 'HASH';
+
+                    for my $colname (keys %$rel_cond) {
+                        next unless defined $rel_cond->{$colname} and any { $_ eq $colname } @pks;
+                        $pk_kvs{$colname} = $rel_cond->{$colname};
+                    }
+                }
+            }
+
             my $related_object;
 
             # support the special case where a method on the related row
@@ -559,7 +591,7 @@ sub _update_relation {
             # see DBSchema::Result::DVD relationship keysbymethod
             DEBUG and warn "pk columns so far: " . join (', ',
                 sort keys %pk_kvs) . "\n";
-            my @non_pk_columns = grep {
+            @non_pk_columns = grep {
                     my $colname = $_;
                     none { $colname eq $_ } keys %pk_kvs
                 }
