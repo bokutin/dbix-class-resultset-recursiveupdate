@@ -45,6 +45,8 @@ use Data::Dumper::Concise;
 
 use constant DEBUG => 0;
 
+our $IN_RU = 0;
+
 sub recursive_update {
     my %params = @_;
     my ( $self, $updates, $fixed_fields, $object, $resolved, $if_not_submitted,
@@ -54,6 +56,18 @@ sub recursive_update {
         };
     $resolved ||= {};
     $ENV{DBIC_NULLABLE_KEY_NOWARN} = 1;
+
+    my $related_rows;
+    if ( exists $params{related_rows} ) {
+        if ( $IN_RU ) {
+            $related_rows = $params{related_rows};
+        }
+        else {
+            die "parameter related_rows is private.";
+        }
+    }
+
+    local $IN_RU = $IN_RU+1;
 
     my $source = $self->result_source;
 
@@ -84,7 +98,7 @@ sub recursive_update {
     my @pks = $source->primary_columns;
     my %pk_kvs;
     for my $colname (@pks) {
-        if (exists $updates->{$colname} && defined $updates->{$colname}) {
+        if (exists $updates->{$colname} && defined $updates->{$colname} && !ref $updates->{$colname}) {
             $pk_kvs{$colname} = $updates->{$colname};
             next;
         }
@@ -191,8 +205,24 @@ $_\n";
         };
     }
 
+    if ( !$object and $related_rows and keys %pk_kvs ) {
+        $object = _get_matching_row(\%pk_kvs, $related_rows);
+    }
+
+    if ( !$object and $related_rows and keys %pk_kvs ) {
+        my $relink = any {
+            no warnings 'uninitialized';
+            $resolved->{$_} ne $pk_kvs{$_}
+        } keys %$resolved;
+        DEBUG and warn "check relink\n";
+        unless ($relink) {
+            DEBUG and warn "create new row for not relink\n";
+            $object = $self->new_result({});
+        }
+    }
+
     # check if row can be found in resultset cache
-    if ( !defined $object && scalar keys %pk_kvs == scalar @pks ) {
+    if ( !defined $object && !$related_rows && scalar keys %pk_kvs == scalar @pks ) {
         my $cached_rows = $self->get_cache;
         if (defined $cached_rows) {
             DEBUG and warn "find in cache\n";
@@ -510,206 +540,12 @@ sub _update_relation {
         for my $sub_updates ( @{$updates} ) {
             DEBUG and warn "updating related row: " . Dumper($sub_updates)
                 . "\n";
-            my %pk_kvs;
-            # detect the special case where the primary key of a currently not
-            # related row is passed in the updates hash
-            # let the resolved column values fill any missing primary key
-            # columns but not overwrite them
-            for my $colname (@pks) {
-                if (exists $sub_updates->{$colname}
-                    && defined $sub_updates->{$colname}) {
-                    # $sub_updates->{$colname} might be a hashref if a
-                    # relationship is named the same as a foreign key column
-                    if (ref $sub_updates->{$colname} eq 'HASH') {
-                        if ($related_source->has_relationship($colname)) {
-                            my $rel_info = $related_source
-                                ->relationship_info($colname);
-                            my @rel_cols = sort keys %{ $rel_info->{cond} };
-                            map { s/^foreign\.// } @rel_cols;
-                            $self->throw_exception("passing a hashref for " .
-                                "a multi-column relationship named the " .
-                                "same as a column ('$colname') is not " .
-                                "implemented")
-                                if scalar @rel_cols != 1;
-                            DEBUG and warn "using '$rel_cols[0]' in hashref " .
-                                "for primary key column '$colname'\n";
-                            $pk_kvs{$colname} = $sub_updates->{$colname}
-                                ->{$rel_cols[0]};
-                        }
-                        else {
-                            $self->throw_exception(
-                                "data for $colname is a hashref but no " .
-                                "relationship with that name exists");
-                        }
-                    }
-                    else {
-                        $pk_kvs{$colname} = $sub_updates->{$colname};
-                    }
-                    next;
-                }
-                $pk_kvs{$colname} = $resolved->{$colname}
-                    if exists $resolved->{$colname}
-                        && defined $resolved->{$colname};
-            }
-            my @non_pk_columns = grep {
-                    my $colname = $_;
-                    none { $colname eq $_ } keys %pk_kvs
-                }
-                sort keys %$sub_updates;
-            if ( scalar keys %pk_kvs != scalar @pks && @non_pk_columns) {
-                for my $key (keys %$sub_updates) {
-                    next unless $related_source->has_relationship($key) and _master_relation_cond($related_resultset, $key);
-                    my $val = do {
-                        if ( ref $sub_updates->{$key} ) {
-                            $sub_updates->{$key};
-                        }
-                        else {
-                            my ($pk) = $related_source->related_source($key)->primary_columns;
-                            +{ $pk => $sub_updates->{$key} };
-                        }
-                    };
-                    my $relinfo = $related_source->relationship_info($key);
-                    my ($rel_cond, $crosstable) = $related_source->_resolve_condition(
-                        $relinfo->{cond}, $val, $key, $key
-                    );
-
-                    $self->throw_exception("Complex condition via relationship '$key' is unsupported in find()")
-                        if $crosstable or ref($rel_cond) ne 'HASH';
-
-                    for my $colname (keys %$rel_cond) {
-                        next unless defined $rel_cond->{$colname} and any { $_ eq $colname } @pks;
-                        $pk_kvs{$colname} = $rel_cond->{$colname};
-                    }
-                }
-            }
-
-            my $related_object;
-
-            # support the special case where a method on the related row
-            # populates one or more primary key columns and we don't have
-            # all primary key values already
-            # see DBSchema::Result::DVD relationship keysbymethod
-            DEBUG and warn "pk columns so far: " . join (', ',
-                sort keys %pk_kvs) . "\n";
-            @non_pk_columns = grep {
-                    my $colname = $_;
-                    none { $colname eq $_ } keys %pk_kvs
-                }
-                sort keys %$sub_updates;
-            DEBUG and warn "non-pk columns: " . join (', ',
-                @non_pk_columns) . "\n";
-            if ( scalar keys %pk_kvs != scalar @pks && @non_pk_columns) {
-                DEBUG and warn "not all primary keys available, trying " .
-                    "object creation\n";
-                # new_result throws exception if non column values are passed
-                # because we want to also support e.g. a BUILDARGS method that
-                # populates primary key columns from an additional value
-                # filter out all relationships
-                my @non_rel_columns = grep {
-                        !is_m2m( $related_resultset, $_ )
-                        && !$related_result_source->has_relationship($_)
-                    }
-                    sort keys %$sub_updates;
-                my %non_rel_updates = map {
-                    $_ => $sub_updates->{$_}
-                } @non_rel_columns;
-                # transform columns specified by their accessor name
-                my %columns_by_accessor = _get_columns_by_accessor($related_resultset);
-                for my $accessor_name (sort keys %columns_by_accessor) {
-                    my $colname = $columns_by_accessor{$accessor_name}->{name};
-                    if ($accessor_name ne $colname
-                        && exists $non_rel_updates{$accessor_name}) {
-                        DEBUG and warn "renaming column accessor " .
-                            "'$accessor_name' to column name '$colname'\n";
-                        $non_rel_updates{$colname} = delete
-                            $non_rel_updates{$accessor_name};
-                    }
-                }
-                DEBUG and warn "using all non-rel updates for object " .
-                    "construction: " . Dumper(\%non_rel_updates);
-                # the object creation might fail because of non-column and
-                # non-constructor handled parameters which shouldn't break RU
-                try {
-                    my $related_row = $related_resultset
-                        ->new_result(\%non_rel_updates);
-                    for my $colname (@pks) {
-                        next
-                            if exists $pk_kvs{$colname};
-
-                        if ($related_row->can($colname)
-                            && defined $related_row->$colname) {
-                            DEBUG and warn "missing pk column $colname exists " .
-                                "and defined on object\n";
-                            $pk_kvs{$colname} = $related_row->$colname;
-                        }
-                        else {
-                            DEBUG and warn "missing pk column $colname doesn't "
-                                . "exist or isn't defined on object, aborting\n";
-                            last;
-                        }
-                    }
-                }
-                catch {
-                    DEBUG and warn "object construction failed, ignoring:
-$_\n";
-                };
-            }
-
-            # The only reasons to let recursive_update search for an existing
-            # row (= not passing a new result to it) is relinking of existing
-            # rows.
-            # Relinking is only possible if all primary key column values are
-            # known and only required if at least one of the foreign row
-            # columns, which are part of the relationship, differ between
-            # current and target ones.
-            # There are two different cases:
-            # The foreign row columns are part of the foreign primary key.
-            # An example is the dvdtags relationship of Dvd.
-            # Or one or more non primary key form the relationship.
-            # An example is the owned_dvds relationship of User.
-            my $relink = 0;
-
-            if ( scalar keys %pk_kvs == scalar @pks ) {
-                DEBUG and warn "all primary keys available, " .
-                    "searching for row in currently related rows\n";
-                # the lookup can fail if the primary key of a currently not
-                # related row is passed in the updates hash
-                $related_object = _get_matching_row(\%pk_kvs, \@related_rows);
-                # %pk_kvs contains the scalar value instead of a hashref
-                # when a column and relationship are named the same so
-                # overwrite the hashref in $sub_updates with that
-                # don't include %$resolved as well as that contains target data
-                my %current_data = (%$sub_updates, %pk_kvs);
-                DEBUG and warn "current data: " . Dumper(\%current_data);
-                DEBUG and warn "target data: " . Dumper($resolved);
-
-                no warnings 'uninitialized';
-
-                # If the row can't be found by _get_matching_row it is
-                # currently not linked or doesn't even exist. In this case we
-                # must execute a sql select to find it.
-                $relink = 1
-                    if (not defined $related_object)
-                        && (any { $resolved->{$_} ne $current_data{$_} }
-                            keys %$resolved);
-            }
-            DEBUG and warn "relink: $relink\n";
-
-            # pass an empty object if no related row found and it's not the
-            # special case where the primary key of a currently not related
-            # row is passed in the updates hash to prevent the find by pk in
-            # recursive_update to happen
-            if ((not defined $related_object) && (not $relink)) {
-                DEBUG and warn "passing empty row to prevent find by pk\n";
-                $related_object = $related_resultset->new_result({});
-            }
 
             my $sub_object = recursive_update(
                 resultset => $related_resultset,
                 updates   => $sub_updates,
                 resolved  => $resolved,
-                # pass prefetched object if found
-                object    => $related_object,
+                related_rows => \@related_rows,
             );
 
             push @updated_objs, $sub_object;
