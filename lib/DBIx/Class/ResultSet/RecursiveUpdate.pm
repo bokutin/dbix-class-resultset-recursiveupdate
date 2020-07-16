@@ -186,11 +186,11 @@ sub recursive_update {
                 next
                     if exists $pk_kvs{$colname};
 
-                if ($row->can($colname)
-                    && defined $row->$colname) {
+                if ($row->has_column($colname)
+                    && defined $row->get_column($colname)) {
                     DEBUG and warn "missing pk column $colname exists " .
                         "and defined on object\n";
-                    $pk_kvs{$colname} = $row->$colname;
+                    $pk_kvs{$colname} = $row->get_column($colname);
                 }
                 else {
                     DEBUG and warn "missing pk column $colname doesn't "
